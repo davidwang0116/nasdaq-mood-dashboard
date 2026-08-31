@@ -5,6 +5,13 @@ import requests
 import yfinance as yf
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
+
+_NY = ZoneInfo("America/New_York")
+DD_LOOKBACK = 252   # trading days (~1 year)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -16,6 +23,21 @@ TIMEOUT = 10
 
 class FetchError(Exception):
     pass
+
+
+def _cnn_ts_to_date(ts) -> str:
+    """CNN timestamp (ms int or ISO string) → NY-local date YYYY-MM-DD."""
+    if isinstance(ts, (int, float)):
+        dt = datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.timezone.utc)
+    else:
+        s = str(ts).replace("Z", "+00:00")
+        try:
+            dt = datetime.datetime.fromisoformat(s)
+        except ValueError:
+            return s[:10]
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(_NY).date().isoformat()
 
 
 def _get(url, **kw):
@@ -71,7 +93,7 @@ def fetch_fgi():
         raise FetchError(f"FGI value {value} out of range")
     ts = fg.get("timestamp", "")
     try:
-        date = ts[:10]
+        date = _cnn_ts_to_date(ts) if ts else datetime.date.today().isoformat()
     except Exception:
         date = datetime.date.today().isoformat()
     return {"value": value, "as_of": date, "source": "cnn"}
@@ -198,4 +220,24 @@ def _compute_ndx100_pe():
         "computed_at": datetime.datetime.now().isoformat(),
         "excluded": excluded,
         "total": total,
+    }
+
+
+def fetch_drawdown():
+    """Current QQQ drawdown vs. 252-trading-day peak. Returns negative float."""
+    df = yf.Ticker("QQQ").history(period="2y")
+    if df.empty or len(df) < 60:
+        raise FetchError("QQQ 历史数据不足")
+    close = df["Close"].dropna()
+    peak = float(close.tail(DD_LOOKBACK).max())
+    last = float(close.iloc[-1])
+    dd = (last / peak - 1.0) * 100.0
+    if not (-90 <= dd <= 0.5):
+        raise FetchError(f"回撤值异常: {dd:.2f}")
+    return {
+        "value": min(dd, 0.0),
+        "peak": round(peak, 2),
+        "last": round(last, 2),
+        "as_of": close.index[-1].date().isoformat(),
+        "source": "yfinance",
     }

@@ -1,9 +1,33 @@
 import datetime
-from scoring import band_of, score_vxn, score_fgi, score_pe, composite as _composite
+from scoring import (band_of, score_vxn, score_fgi, score_dd,
+                     fear_axis as _fear_axis, composite_v2 as _composite_v2,
+                     composite as _composite_v1)
+
+# DD tier table (shallow → deep), used for display and chart band lookup
+_DD_TIERS = [
+    (   0,   -3, "高位运行",   "正常 1.0x"),
+    (  -3,   -7, "常规波动",   "正常 1.0x"),
+    (  -7,  -15, "技术性调整", "加仓 1.5x"),
+    ( -15,  -25, "熊市区间",   "加仓 2.0x"),
+    ( -25, -999, "深度恐慌",   "重仓 2.0x+"),
+]
+
+# Bands for _metric_chart — note: lo/hi are numbers, boundaries computed from hi values
+_DD_CHART_BANDS = [
+    [-100,  -25, "深度恐慌",   "重仓 2.0x+"],
+    [ -25,  -15, "熊市区间",   "加仓 2.0x"],
+    [ -15,   -7, "技术性调整", "加仓 1.5x"],
+    [  -7,   -3, "常规波动",   "正常 1.0x"],
+    [  -3,    0, "高位运行",   "正常 1.0x"],
+]
 
 
 def _color(metric):
-    return {"vxn": "#d97706", "fgi": "#c2410c", "pe": "#dc2626", "composite": "#16a34a"}[metric]
+    return {
+        "vxn": "#d97706", "fgi": "#c2410c",
+        "pe": "#dc2626",  "dd": "#dc2626",
+        "composite": "#16a34a",
+    }[metric]
 
 
 def _metric_chart(dates, values, bands, color, current_value, w=272, h=130):
@@ -14,20 +38,18 @@ def _metric_chart(dates, values, bands, color, current_value, w=272, h=130):
             f'justify-content:center;color:#9ca3af;font-size:11px;">暂无历史数据</div>'
         )
 
-    # All finite band boundaries — always show every divider regardless of data range
     boundaries = sorted({lo for lo, hi, *_ in bands if lo > 0}
                         | {hi for lo, hi, *_ in bands if hi < 900})
 
-    # Y-axis: must cover every finite boundary + data, with a small padding
     data_min, data_max = min(values), max(values)
     pad = max((data_max - data_min) * 0.08, 0.8)
     y_min = min(data_min - pad, boundaries[0]  if boundaries else data_min - pad)
     y_max = max(data_max + pad, boundaries[-1] if boundaries else data_max + pad)
     y_rng = y_max - y_min or 1
 
-    ML, MR, MT, MB = 26, 4, 6, 16   # margins: left, right, top, bottom
-    cw = w - ML - MR                  # chart width
-    ch = h - MT - MB                  # chart height
+    ML, MR, MT, MB = 26, 4, 6, 16
+    cw = w - ML - MR
+    ch = h - MT - MB
 
     def xp(i):
         n = len(values)
@@ -36,7 +58,6 @@ def _metric_chart(dates, values, bands, color, current_value, w=272, h=130):
     def yp(v):
         return MT + ch - (v - y_min) / y_rng * ch
 
-    # Find which band the current value falls in
     cur_band = None
     for lo, hi, label, action in bands:
         if lo <= current_value < hi:
@@ -47,7 +68,6 @@ def _metric_chart(dates, values, bands, color, current_value, w=272, h=130):
 
     parts = []
 
-    # ── current band zone highlight ──────────────────────────────────────
     if cur_band:
         lo, hi = cur_band[0], cur_band[1]
         rect_top    = max(MT,      yp(min(hi if hi < 900 else y_max, y_max)))
@@ -58,7 +78,6 @@ def _metric_chart(dates, values, bands, color, current_value, w=272, h=130):
                 f'height="{rect_bottom - rect_top:.1f}" fill="{color}18"/>'
             )
 
-    # ── band boundary dashed lines + left-side value labels ──────────────
     for b in boundaries:
         if y_min <= b <= y_max:
             y = yp(b)
@@ -71,18 +90,113 @@ def _metric_chart(dates, values, bands, color, current_value, w=272, h=130):
                 f'dominant-baseline="middle" font-size="9" fill="#9ca3af">{b}</text>'
             )
 
-    # ── time-series line ─────────────────────────────────────────────────
     pts = " ".join(f"{xp(i):.1f},{yp(v):.1f}" for i, v in enumerate(values))
     parts.append(
         f'<polyline points="{pts}" fill="none" stroke="{color}" '
         f'stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>'
     )
 
-    # ── current-value dot ────────────────────────────────────────────────
     lx, ly = xp(len(values) - 1), yp(values[-1])
     parts.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="3.5" fill="{color}"/>')
 
-    # ── date labels: first and last ───────────────────────────────────────
+    if dates:
+        ty = MT + ch + 12
+        parts.append(
+            f'<text x="{ML}" y="{ty}" text-anchor="start" font-size="9" fill="#9ca3af">'
+            f'{dates[0][5:]}</text>'
+        )
+        parts.append(
+            f'<text x="{w - MR}" y="{ty}" text-anchor="end" font-size="9" fill="#9ca3af">'
+            f'{dates[-1][5:]}</text>'
+        )
+
+    body = "\n  ".join(parts)
+    return (
+        f'<svg viewBox="0 0 {w} {h}" width="100%" height="{h}" '
+        f'xmlns="http://www.w3.org/2000/svg" style="display:block;overflow:visible;">'
+        f'\n  {body}\n</svg>'
+    )
+
+
+def _dd_chart(dates, values, w=272, h=130):
+    """Adaptive-range SVG chart for drawdown (negative %)."""
+    color = "#dc2626"
+    if not values or len(values) < 2:
+        return (
+            f'<div style="height:{h}px;display:flex;align-items:center;'
+            f'justify-content:center;color:#9ca3af;font-size:11px;">暂无历史数据</div>'
+        )
+
+    data_min, data_max = min(values), max(values)
+    pad = max((data_max - data_min) * 0.08, 0.3)
+
+    # Y range: always show at least down to -7 for context
+    y_max = 1.0
+    y_min = min(data_min - pad, -7.0)
+    # If data goes below -15, extend to show that boundary too
+    if data_min < -14:
+        y_min = min(data_min - pad, -15.0)
+    if data_min < -24:
+        y_min = min(data_min - pad, -25.0)
+    y_rng = y_max - y_min or 1
+
+    all_bounds = [0, -3, -7, -15, -25]
+    boundaries = [b for b in all_bounds if y_min <= b <= y_max]
+
+    ML, MR, MT, MB = 32, 4, 6, 16
+    cw = w - ML - MR
+    ch = h - MT - MB
+
+    def xp(i):
+        n = len(values)
+        return ML + (i / (n - 1) * cw if n > 1 else cw / 2)
+
+    def yp(v):
+        return MT + ch - (v - y_min) / y_rng * ch
+
+    # Current tier for zone highlight
+    cur_lo, cur_hi = None, None
+    v_last = values[-1]
+    if v_last >= 0:
+        cur_lo, cur_hi = 0, 1
+    else:
+        for hi, lo, *_ in _DD_TIERS:
+            if lo < v_last <= hi:
+                cur_lo, cur_hi = lo, hi
+                break
+
+    parts = []
+
+    if cur_lo is not None and cur_hi is not None:
+        yt = max(MT, yp(min(cur_hi, y_max)))
+        yb = min(MT + ch, yp(max(cur_lo, y_min)))
+        if yb > yt:
+            parts.append(
+                f'<rect x="{ML}" y="{yt:.1f}" width="{cw}" '
+                f'height="{yb - yt:.1f}" fill="{color}18"/>'
+            )
+
+    for b in boundaries:
+        y = yp(b)
+        lbl = f"{b}%"
+        parts.append(
+            f'<line x1="{ML}" y1="{y:.1f}" x2="{w - MR}" y2="{y:.1f}" '
+            f'stroke="#d1d5db" stroke-width="1" stroke-dasharray="4,3"/>'
+        )
+        parts.append(
+            f'<text x="{ML - 3}" y="{y:.1f}" text-anchor="end" '
+            f'dominant-baseline="middle" font-size="9" fill="#9ca3af">{lbl}</text>'
+        )
+
+    pts = " ".join(f"{xp(i):.1f},{yp(v):.1f}" for i, v in enumerate(values))
+    parts.append(
+        f'<polyline points="{pts}" fill="none" stroke="{color}" '
+        f'stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>'
+    )
+
+    lx, ly = xp(len(values) - 1), yp(values[-1])
+    parts.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="3.5" fill="{color}"/>')
+
     if dates:
         ty = MT + ch + 12
         parts.append(
@@ -154,34 +268,121 @@ def _metric_card(key, display_name, tag, raw, score, stale_days, config,
 </div>"""
 
 
+def _dd_card(dd_data, s_dd, config, pe_data=None, history=None):
+    """Drawdown card replacing the old PE card."""
+    color = "#dc2626"
+    dd_val = float(dd_data.get("value", 0.0))
+    is_ath = dd_val >= 0
+
+    # Tier lookup
+    tier_label = "站上新高" if is_ath else "高位运行"
+    if not is_ath:
+        for hi, lo, lbl, _ in _DD_TIERS:
+            if lo < dd_val <= hi:
+                tier_label = lbl
+                break
+
+    # Format percentage
+    pct_str = "0.00%" if is_ath else f"{dd_val:.2f}%"
+
+    # History chart
+    hist_dates = history.get("dates", []) if history else []
+    hist_values = history.get("values", []) if history else []
+    chart_html = _dd_chart(hist_dates, hist_values)
+
+    # Tier table (5 rows, current highlighted)
+    tier_rows = ""
+    table_tiers = [
+        ("0% ~ −3%",   "高位运行",   "正常 1.0x"),
+        ("−3% ~ −7%",  "常规波动",   "正常 1.0x"),
+        ("−7% ~ −15%", "技术性调整", "加仓 1.5x"),
+        ("−15% ~ −25%","熊市区间",   "加仓 2.0x"),
+        ("< −25%",     "深度恐慌",   "重仓 2.0x+"),
+    ]
+    tier_labels_ordered = [r[1] for r in table_tiers]
+    for rng, lbl, act in table_tiers:
+        is_cur = (lbl == tier_label) or (is_ath and lbl == "高位运行")
+        bg = f"background:{color}18;" if is_cur else ""
+        fw = "font-weight:600;" if is_cur else ""
+        cl = f"color:{color};" if is_cur else "color:#6b7280;"
+        tier_rows += (
+            f'<tr style="{bg}{fw}{cl}font-size:9px;">'
+            f'<td style="padding:1px 3px;">{rng}</td>'
+            f'<td style="padding:1px 3px;">{lbl}</td>'
+            f'<td style="padding:1px 3px;text-align:right;">{act}</td>'
+            f'</tr>'
+        )
+
+    # PE reference row
+    pe_ref = ""
+    if pe_data:
+        pe_stale = pe_data.get("stale_days", 0)
+        pe_val = pe_data.get("value", 0)
+        pe_date = pe_data.get("as_of", "")
+        ref_col = "#92400e" if pe_stale > 45 else "#9ca3af"
+        ref_bg  = "background:#fef3c7;" if pe_stale > 45 else ""
+        pe_ref = (
+            f'<div style="font-size:9px;color:{ref_col};{ref_bg}margin-top:6px;'
+            f'padding:2px 4px;border-radius:4px;line-height:1.5;">'
+            f'参考：纳指100 PE {pe_val:.2f}（{pe_date}）· 不参与综合评分</div>'
+        )
+
+    ath_note = '<span style="font-size:11px;color:#9ca3af;margin-left:4px;">站上新高</span>' if is_ath else ""
+
+    return f"""<div style="background:#fffdfa;border-radius:16px;padding:18px 16px 14px;box-shadow:0 1px 6px rgba(0,0,0,.07);">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <div style="font-size:14px;font-weight:600;color:#1c1917;">回撤</div>
+    <span style="background:{color}22;color:{color};font-size:10px;padding:2px 7px;border-radius:99px;font-weight:600;">估值</span>
+  </div>
+  <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:8px;">
+    <div>
+      <span style="font-size:32px;font-weight:700;color:{color};line-height:1;">{pct_str}</span>{ath_note}
+    </div>
+    <div style="margin-left:auto;text-align:right;padding-right:4px;">
+      <div style="font-size:10px;color:#9ca3af;">子分</div>
+      <div style="font-size:20px;font-weight:700;color:#374151;">{s_dd:.0f}<span style="font-size:11px;color:#9ca3af;">/100</span></div>
+    </div>
+    <div style="text-align:right;">
+      <div style="font-size:10px;color:#9ca3af;">区间</div>
+      <div style="font-size:11px;font-weight:600;color:{color};max-width:60px;text-align:right;line-height:1.3;">{tier_label}</div>
+    </div>
+  </div>
+  <table style="width:100%;border-collapse:collapse;margin-bottom:6px;">
+    {tier_rows}
+  </table>
+  {chart_html}
+  {pe_ref}
+</div>"""
+
+
 def _compute_composite_history(metric_histories):
-    """Align VXN/FGI/PE history by trading date and compute daily composite scores."""
+    """Align VXN/FGI/DD history and compute daily v2 composite scores."""
     vxn_h = metric_histories.get("vxn", {})
     fgi_h = metric_histories.get("fgi", {})
-    pe_h  = metric_histories.get("pe",  {})
+    dd_h  = metric_histories.get("dd",  {})
 
-    if not (vxn_h.get("dates") and fgi_h.get("dates") and pe_h.get("dates")):
+    if not (vxn_h.get("dates") and fgi_h.get("dates") and dd_h.get("dates")):
         return [], []
 
     vxn_map = dict(zip(vxn_h["dates"], vxn_h["values"]))
     fgi_map = dict(zip(fgi_h["dates"], fgi_h["values"]))
-    pe_map  = dict(zip(pe_h["dates"],  pe_h["values"]))
+    dd_map  = dict(zip(dd_h["dates"],  dd_h["values"]))
 
     all_dates = sorted(vxn_map)
     out_dates, out_scores = [], []
-    last_fgi = last_pe = None
+    last_fgi = last_dd = None
 
     for d in all_dates:
         v = vxn_map.get(d)
         if v is None:
             continue
         f = fgi_map.get(d, last_fgi)
-        p = pe_map.get(d, last_pe)
+        dv = dd_map.get(d, last_dd)
         if f is not None: last_fgi = f
-        if p is not None: last_pe  = p
-        if f is None or p is None:
+        if dv is not None: last_dd = dv
+        if f is None or dv is None:
             continue
-        s = _composite(score_vxn(v), score_pe(p), score_fgi(f))
+        s = _composite_v2(score_vxn(v), score_fgi(f), score_dd(dv))
         out_dates.append(d)
         out_scores.append(round(s, 1))
 
@@ -197,7 +398,6 @@ def _composite_trend(metric_histories, config, current_composite):
     if len(scores) < 2:
         return ""
 
-    # ── Align QQQ prices to composite dates and min-max normalise to [0,100] ──
     qqq_h   = metric_histories.get("qqq", {})
     qqq_map = dict(zip(qqq_h.get("dates", []), qqq_h.get("values", [])))
     qqq_raw = []
@@ -219,8 +419,7 @@ def _composite_trend(metric_histories, config, current_composite):
         ]
     has_qqq = len(qqq_norm) > 1
 
-    # Multiplier band boundaries (always 0–100 range)
-    mult_bands = config["multiplier_bands"]   # [[lo, hi, label, mult], ...]
+    mult_bands = config["multiplier_bands"]
     boundaries = sorted({lo for lo, *_ in mult_bands if lo > 0}
                         | {hi for lo, hi, *_ in mult_bands if hi < 101})
 
@@ -230,9 +429,7 @@ def _composite_trend(metric_histories, config, current_composite):
     ch = H - MT - MB
     n  = len(scores)
 
-    # Y-axis: always cover 0–100 (or at least all band boundaries + data)
-    y_min = 0.0
-    y_max = 100.0
+    y_min, y_max = 0.0, 100.0
     y_rng = y_max - y_min
 
     def xp(i):
@@ -241,7 +438,6 @@ def _composite_trend(metric_histories, config, current_composite):
     def yp(v):
         return MT + ch - (v - y_min) / y_rng * ch
 
-    # Current band
     cur_band = None
     for lo, hi, label, mult in mult_bands:
         if lo <= current_composite < hi:
@@ -250,7 +446,6 @@ def _composite_trend(metric_histories, config, current_composite):
 
     parts = []
 
-    # Zone highlight for current band
     if cur_band:
         lo, hi = cur_band[0], cur_band[1]
         rt = max(MT, yp(min(hi, y_max)))
@@ -261,7 +456,6 @@ def _composite_trend(metric_histories, config, current_composite):
                 f'height="{rb - rt:.1f}" fill="#16a34a18"/>'
             )
 
-    # Dashed multiplier zone dividers + right-side labels
     mult_map = {lo: (label, mult) for lo, hi, label, mult in mult_bands}
     for b in boundaries:
         y = yp(b)
@@ -273,7 +467,6 @@ def _composite_trend(metric_histories, config, current_composite):
             f'<text x="{ML - 3}" y="{y:.1f}" text-anchor="end" '
             f'dominant-baseline="middle" font-size="9" fill="#9ca3af">{b}</text>'
         )
-        # Band label on right
         if b in mult_map:
             band_lbl, band_mult = mult_map[b]
             parts.append(
@@ -281,7 +474,6 @@ def _composite_trend(metric_histories, config, current_composite):
                 f'dominant-baseline="middle" font-size="8.5" fill="#9ca3af">{band_mult}x</text>'
             )
 
-    # ── QQQ price overlay (min-max normalised, drawn first so it's behind) ──
     if has_qqq:
         qqq_pts_list = [
             f"{xp(i):.1f},{yp(v):.1f}"
@@ -295,14 +487,12 @@ def _composite_trend(metric_histories, config, current_composite):
                 f'stroke-linejoin="round" stroke-linecap="round"/>'
             )
 
-    # ── Composite score line ─────────────────────────────────────────────
     pts = " ".join(f"{xp(i):.1f},{yp(v):.1f}" for i, v in enumerate(scores))
     parts.append(
         f'<polyline points="{pts}" fill="none" stroke="#16a34a" '
         f'stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'
     )
 
-    # Latest dot + label
     lx, ly = xp(n - 1), yp(scores[-1])
     parts.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="4" fill="#16a34a"/>')
     label_anchor = "end" if lx > W * 0.85 else "middle"
@@ -312,14 +502,12 @@ def _composite_trend(metric_histories, config, current_composite):
         f'font-size="11" font-weight="600" fill="#16a34a">{scores[-1]}</text>'
     )
 
-    # Date labels: start, ~2-month mark, ~1-month mark, end
     import datetime as _dt
-    ty   = MT + ch + 13   # text baseline
-    tk_y = MT + ch        # top of tick mark
+    ty   = MT + ch + 13
+    tk_y = MT + ch
 
     def _add_date_label(idx, anchor):
         x = xp(idx)
-        # tiny tick
         parts.append(
             f'<line x1="{x:.1f}" y1="{tk_y:.1f}" x2="{x:.1f}" y2="{tk_y + 3:.1f}" '
             f'stroke="#d1d5db" stroke-width="1"/>'
@@ -329,30 +517,20 @@ def _composite_trend(metric_histories, config, current_composite):
             f'font-size="9" fill="#9ca3af">{dates[idx][5:]}</text>'
         )
 
-    # Start and end
     _add_date_label(0, "start")
     _add_date_label(n - 1, "end")
 
-    # Find indices closest to 1-month-ago and 2-months-ago
-    today_str = dates[-1]
-    today_dt  = _dt.date.fromisoformat(today_str)
+    today_dt = _dt.date.fromisoformat(dates[-1])
     for offset_months, anchor in [(2, "middle"), (1, "middle")]:
         target = today_dt - _dt.timedelta(days=offset_months * 31)
-        target_str = target.isoformat()
-        # pick the index whose date is closest to target
-        best_i = min(range(n), key=lambda i: abs(dates[i] > target_str) * 1000
-                     + (0 if dates[i] <= target_str else 999))
-        # more robust: use string comparison to find closest
         best_i = min(range(n), key=lambda i: abs(
             (_dt.date.fromisoformat(dates[i]) - target).days
         ))
-        # avoid overlapping with start/end (keep at least 8% of chart width away)
         ix = xp(best_i)
         if ix < ML + cw * 0.08 or ix > ML + cw * 0.92:
             continue
         _add_date_label(best_i, "middle")
 
-    # ── Legend (bottom-right of SVG, inside chart area) ─────────────────
     legend_y = MT + ch - 4
     legend_x = ML + cw - 2
     parts.append(
@@ -381,7 +559,6 @@ def _composite_trend(metric_histories, config, current_composite):
         f'\n  {body}\n</svg>'
     )
 
-    # QQQ latest price for subtitle
     qqq_latest = ""
     if valid_q:
         qqq_latest = f'<span style="font-size:10px;color:#93c5fd;margin-left:8px;font-weight:500;">QQQ ${valid_q[-1]:.2f}</span>'
@@ -393,12 +570,13 @@ def _composite_trend(metric_histories, config, current_composite):
 
 
 def render_dashboard(result, config, history_csv, metric_histories=None, offline_mode=False):
-    metrics = result["metrics"]
-    comp    = result["composite"]
-    mult    = result["multiplier"]
-    label   = result["label"]
-    med_mult = result.get("median_multiplier", mult)
-    run_at  = result.get("run_at", "")[:16].replace("T", " ")
+    metrics    = result["metrics"]
+    comp       = result["composite"]
+    mult       = result["multiplier"]
+    label      = result["label"]
+    fear_ax    = result.get("fear_axis", comp)
+    value_ax   = result.get("value_axis", comp)
+    run_at     = result.get("run_at", "")[:16].replace("T", " ")
     trade_date = result.get("trade_date", "")
 
     mh = metric_histories or {}
@@ -412,23 +590,16 @@ def render_dashboard(result, config, history_csv, metric_histories=None, offline
         )
 
     diverge_warn = ""
-    if med_mult != mult:
+    if abs(fear_ax - value_ax) > 25:
         diverge_warn = (
             f'<div style="font-size:12px;color:#92400e;margin-top:5px;">'
-            f'⚠ 指标分歧：单指标中位数建议 {med_mult}x</div>'
+            f'⚠ 两轴分歧：情绪与价位不同步</div>'
         )
 
     vxn = metrics["vxn"]
     fgi = metrics["fgi"]
-    pe  = metrics["pe"]
-
-    pe_source = pe.get("source", "manual")
-    if "computed" in pe_source:
-        excluded = pe.get("excluded", 0)
-        total = pe.get("total", 0)
-        pe_extra = f"slickcharts + yfinance 自算（{total - excluded}/{total} 只有效）· 历史值按指数价格比例近似"
-    else:
-        pe_extra = "手动值（config.json）· 建议每月更新"
+    pe  = metrics.get("pe", {})
+    dd  = metrics.get("dd", {})
 
     card_vxn = _metric_card(
         "vxn", "VXN 恐慌指数", "波动率",
@@ -440,17 +611,15 @@ def render_dashboard(result, config, history_csv, metric_histories=None, offline
         fgi["value"], fgi["score"], fgi.get("stale_days", 0), config,
         history=mh.get("fgi"),
     )
-    card_pe = _metric_card(
-        "pe", "PE 市盈率", "估值",
-        pe["value"], pe["score"], pe.get("stale_days", 0), config,
-        extra_info=pe_extra,
-        history=mh.get("pe"),
+    card_dd = _dd_card(
+        dd, dd.get("score", 50.0), config,
+        pe_data=pe if pe else None,
+        history=mh.get("dd"),
     )
 
     int_comp = int(comp)
     dec_comp = f"{comp:.2f}".split(".")[1]
     trend_chart = _composite_trend(mh, config, comp)
-    weights = config["weights"]
 
     return f"""<!DOCTYPE html>
 <html lang="zh">
@@ -478,7 +647,7 @@ def render_dashboard(result, config, history_csv, metric_histories=None, offline
   <div class="grid">
     {card_vxn}
     {card_fgi}
-    {card_pe}
+    {card_dd}
     <div style="background:#fffdfa;border-radius:16px;padding:18px 16px 14px;box-shadow:0 1px 6px rgba(0,0,0,.07);">
       <div style="font-size:14px;font-weight:600;color:#1c1917;margin-bottom:10px;">综合评分</div>
       <div style="text-align:center;margin:4px 0 12px;">
@@ -492,9 +661,13 @@ def render_dashboard(result, config, history_csv, metric_histories=None, offline
       </div>
       <div style="text-align:center;font-size:12px;color:#6b7280;margin-bottom:2px;">建议定投倍数</div>
       <div style="text-align:center;font-size:38px;font-weight:800;color:#1c1917;">{mult}x</div>
+      <div style="text-align:center;font-size:11px;color:#9ca3af;margin-top:4px;">
+        恐慌轴 {fear_ax:.1f} · 估值轴 {value_ax:.1f}
+      </div>
       {diverge_warn}
-      <div style="margin-top:12px;font-size:10px;color:#d1d5db;text-align:center;line-height:1.8;">
-        VXN×{weights['vxn']} + PE×{weights['pe']} + FGI×{weights['fgi']}
+      <div style="margin-top:10px;font-size:10px;color:#d1d5db;text-align:center;line-height:1.8;">
+        综合评分 = 恐慌轴×0.50 + 估值轴×0.50<br>
+        <span style="font-size:9px;">恐慌轴 = (VXN + FGI) ÷ 2</span>
       </div>
     </div>
   </div>

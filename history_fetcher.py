@@ -1,5 +1,5 @@
 """
-Fetches and caches 3-month historical data for VXN, FGI, and PE.
+Fetches and caches 3-month historical data for VXN, FGI, PE, QQQ, and Drawdown.
 Each cache file is refreshed once per day (20-hour threshold).
 PE history is approximated as: PE(t) = PE_today × NDX_price(t) / NDX_price_today
 """
@@ -8,6 +8,10 @@ import datetime
 import requests
 import yfinance as yf
 from pathlib import Path
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 CACHE_DIR = Path(__file__).parent / "cache"
 HEADERS = {
@@ -17,6 +21,22 @@ HEADERS = {
     "Referer": "https://edition.cnn.com/",
 }
 _THREE_MONTHS = 92  # days
+_NY = ZoneInfo("America/New_York")
+
+
+def _cnn_ts_to_date(ts) -> str:
+    """CNN timestamp (ms int or ISO string) → NY-local date YYYY-MM-DD."""
+    if isinstance(ts, (int, float)):
+        dt = datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.timezone.utc)
+    else:
+        s = str(ts).replace("Z", "+00:00")
+        try:
+            dt = datetime.datetime.fromisoformat(s)
+        except ValueError:
+            return s[:10]
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(_NY).date().isoformat()
 
 
 def _cutoff():
@@ -82,16 +102,20 @@ def fetch_fgi_history():
     hist_raw = data.get("fear_and_greed_historical", {}).get("data", [])
 
     pairs = []
+    seen = {}
     for item in hist_raw:
         ts_ms = item.get("x", 0)
         score = item.get("y")
         if score is None:
             continue
-        dt = datetime.datetime.fromtimestamp(ts_ms / 1000).date().isoformat()
+        dt = _cnn_ts_to_date(ts_ms)
         if dt >= cutoff:
-            pairs.append((dt, round(float(score), 2)))
+            seen[dt] = round(float(score), 2)
 
-    pairs.sort()
+    # Deduplicate (keep last), sort by date
+    for dt in sorted(seen):
+        pairs.append((dt, seen[dt]))
+
     dates, values = zip(*pairs) if pairs else ([], [])
     result = {"dates": list(dates), "values": list(values)}
     _save_cache("fgi_history.json", result)
@@ -103,7 +127,6 @@ def fetch_pe_history(current_pe_value):
     """
     Approximate PE history: PE(t) ≈ PE_today × NDX(t) / NDX_today.
     Invalidate cache if the base PE changed by more than 2 points.
-    Note: uses current constituents — does not reconstruct historical composition.
     """
     cached = _load_cache("pe_history.json")
     if cached and abs(cached.get("base_pe", 0) - current_pe_value) < 2:
@@ -147,4 +170,38 @@ def fetch_qqq_history():
     result = {"dates": list(dates), "values": list(values)}
     _save_cache("qqq_history.json", result)
     print(f"  [历史] QQQ: {len(dates)} 条，已缓存")
+    return result
+
+
+def fetch_dd_history():
+    """
+    Rolling 252-trading-day peak drawdown for the past 3 months.
+    Fetches 2-year QQQ data to ensure the lookback window is fully populated.
+    Returns values as negative percentages (0 = at all-time high within window).
+    """
+    cached = _load_cache("dd_history.json")
+    if cached:
+        return cached
+
+    df = yf.Ticker("QQQ").history(period="2y")
+    if df.empty or len(df) < 60:
+        return {"dates": [], "values": []}
+
+    close_vals = df["Close"].dropna().values.tolist()
+    close_dates = [d.date().isoformat() for d in df["Close"].dropna().index]
+    cutoff = _cutoff()
+
+    dates, values = [], []
+    for i, (ds, price) in enumerate(zip(close_dates, close_vals)):
+        if ds < cutoff:
+            continue
+        window_start = max(0, i - 252)
+        peak = max(close_vals[window_start: i + 1])
+        dd = round((price / peak - 1.0) * 100.0, 2)
+        dates.append(ds)
+        values.append(min(dd, 0.0))  # clamp; never positive
+
+    result = {"dates": dates, "values": values}
+    _save_cache("dd_history.json", result)
+    print(f"  [历史] 回撤: {len(dates)} 条，已缓存")
     return result

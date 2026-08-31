@@ -32,8 +32,26 @@ def score_pe(v):
 
 
 def composite(s_vxn, s_pe, s_fgi):
-    w = _cfg["weights"]
-    return s_vxn * w["vxn"] + s_pe * w["pe"] + s_fgi * w["fgi"]
+    """v1 composite — kept for backward compat; not used in v2 main flow."""
+    return s_vxn * 0.30 + s_pe * 0.35 + s_fgi * 0.35
+
+
+# ── v2 additions ─────────────────────────────────────────────────────────────
+
+DD_ANCHORS = [(-30, 100), (-20, 90), (-10, 70), (-5, 55), (0, 42)]
+
+
+def score_dd(dd_pct):
+    """Drawdown % (negative) → 0–100 sub-score. Deeper drawdown = higher score."""
+    return _interp(min(float(dd_pct), 0.0), DD_ANCHORS)
+
+
+def fear_axis(s_vxn, s_fgi):
+    return 0.5 * s_vxn + 0.5 * s_fgi
+
+
+def composite_v2(s_vxn, s_fgi, s_dd, w_fear=0.50, w_value=0.50):
+    return w_fear * fear_axis(s_vxn, s_fgi) + w_value * s_dd
 
 
 def band_of(metric, value):

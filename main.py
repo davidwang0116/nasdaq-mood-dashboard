@@ -8,11 +8,13 @@ import http.server
 import webbrowser
 from pathlib import Path
 
-from fetchers import fetch_vxn_with_fallback, fetch_fgi, fetch_pe, FetchError
-from scoring import (score_vxn, score_fgi, score_pe, composite,
-                     multiplier_of, multiplier_label, band_of, median_multiplier)
+from fetchers import fetch_vxn_with_fallback, fetch_fgi, fetch_pe, fetch_drawdown, FetchError
+from scoring import (score_vxn, score_fgi, score_pe, score_dd,
+                     fear_axis, composite_v2,
+                     multiplier_of, multiplier_label)
 from render import render_dashboard
-from history_fetcher import fetch_vxn_history, fetch_fgi_history, fetch_pe_history, fetch_qqq_history
+from history_fetcher import (fetch_vxn_history, fetch_fgi_history,
+                              fetch_pe_history, fetch_qqq_history, fetch_dd_history)
 
 BASE         = Path(__file__).parent
 CACHE_DIR    = BASE / "cache"
@@ -23,8 +25,9 @@ CONFIG_FILE  = BASE / "config.json"
 DASHBOARD    = OUT_DIR / "dashboard.html"
 SERVER_PORT  = 8765
 
-HISTORY_COLS = ["date", "vxn", "fgi", "pe",
-                "score_vxn", "score_fgi", "score_pe", "composite", "multiplier"]
+HISTORY_COLS = ["date", "vxn", "fgi", "pe", "dd",
+                "s_vxn", "s_fgi", "s_pe", "s_dd",
+                "fear", "composite", "multiplier", "score_version"]
 
 
 def load_config():
@@ -40,6 +43,18 @@ def load_cache():
 def save_cache(result):
     CACHE_DIR.mkdir(exist_ok=True)
     CACHE_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _migrate_history():
+    """Backup v1 history.csv (missing dd column) and start fresh."""
+    if not HISTORY_FILE.exists():
+        return
+    with HISTORY_FILE.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    if rows and "dd" not in rows[0]:
+        backup = CACHE_DIR / "history_v1_backup.csv"
+        HISTORY_FILE.rename(backup)
+        print(f"  [迁移] v1历史已备份到 {backup.name}，新文件从今日重新开始")
 
 
 def append_history(row):
@@ -92,7 +107,6 @@ def _port_free(port):
 
 def _start_server():
     port = SERVER_PORT
-    # Try a few ports if the default is taken
     for p in range(port, port + 10):
         if _port_free(p):
             port = p
@@ -102,7 +116,6 @@ def _start_server():
         def log_message(self, fmt, *args):
             pass
 
-    # Change to out/ directory so dashboard.html is the root
     os.chdir(str(OUT_DIR))
     httpd = http.server.HTTPServer(("localhost", port), QuietHandler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -114,8 +127,10 @@ def run():
     config = load_config()
     cache  = load_cache()
 
-    print("=== 纳指情绪仪表盘 ===")
+    print("=== 纳指情绪仪表盘 v2 ===")
     print(f"运行时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    _migrate_history()
 
     # ── 抓取实时数据 ────────────────────────────────────────────────────
     offline = False
@@ -131,14 +146,26 @@ def run():
     except RuntimeError as e:
         print(f"严重: {e}"); offline = True; fgi_data = None
 
+    # PE: non-fatal — only used for display, not composite score
     try:
-        pe_data, _  = fetch_with_cache(fetch_pe, "pe", cache, config)
+        pe_data, _ = fetch_with_cache(fetch_pe, "pe", cache, config)
         print(f"  PE   : {pe_data['value']:.2f}  [{pe_data['as_of']}] via {pe_data['source']}")
+    except Exception as e:
+        print(f"  [pe] 抓取失败（仅展示，不影响评分）: {e}")
+        pe_data = config.get("pe_manual", {"value": 0.0, "as_of": "2000-01-01"})
+        pe_data = {**pe_data, "source": "manual(fallback)",
+                   "stale_days": stale_days(pe_data.get("as_of", "2000-01-01")),
+                   "score": score_pe(pe_data.get("value", 30.0))}
+
+    # DD (回撤): required for composite score
+    try:
+        dd_data, _ = fetch_with_cache(fetch_drawdown, "dd", cache)
+        print(f"  DD   : {dd_data['value']:.2f}%  [{dd_data['as_of']}] peak=${dd_data.get('peak', 0):.2f}")
     except RuntimeError as e:
-        print(f"严重: {e}"); offline = True; pe_data = None
+        print(f"严重: {e}"); offline = True; dd_data = None
 
     # ── 离线兜底 ────────────────────────────────────────────────────────
-    if offline or (vxn_data is None and fgi_data is None and pe_data is None):
+    if offline or (vxn_data is None and fgi_data is None and dd_data is None):
         if cache:
             print("\n全部数据源失败，展示缓存（离线模式）")
             _write_and_open(
@@ -150,17 +177,17 @@ def run():
     # ── 打分 ────────────────────────────────────────────────────────────
     s_vxn = score_vxn(vxn_data["value"])
     s_fgi = score_fgi(fgi_data["value"])
-    s_pe  = score_pe(pe_data["value"])
-    comp  = composite(s_vxn, s_pe, s_fgi)
+    s_pe  = score_pe(pe_data["value"]) if pe_data else 50.0
+    s_dd  = score_dd(dd_data["value"])
+    f_ax  = fear_axis(s_vxn, s_fgi)
+    comp  = composite_v2(s_vxn, s_fgi, s_dd)
     mult  = multiplier_of(comp)
     lbl   = multiplier_label(comp)
 
-    med_mult = median_multiplier(
-        multiplier_of(s_vxn), multiplier_of(s_fgi), multiplier_of(s_pe)
-    )
-
     trade_date = max(
-        vxn_data.get("as_of", ""), fgi_data.get("as_of", ""), pe_data.get("as_of", "")
+        vxn_data.get("as_of", ""),
+        fgi_data.get("as_of", ""),
+        dd_data.get("as_of", ""),
     )
 
     result = {
@@ -171,26 +198,34 @@ def run():
         "metrics": {
             "vxn": {**vxn_data, "score": round(s_vxn, 2)},
             "fgi": {**fgi_data, "score": round(s_fgi, 2)},
-            "pe":  {**pe_data,  "score": round(s_pe,  2)},
+            "pe":  {**(pe_data or {}), "score": round(s_pe, 2)},
+            "dd":  {**dd_data,  "score": round(s_dd, 2)},
         },
-        "composite": round(comp, 2),
-        "multiplier": mult,
-        "label": lbl,
-        "median_multiplier": med_mult,
+        "fear_axis":   round(f_ax, 2),
+        "value_axis":  round(s_dd, 2),
+        "composite":   round(comp, 2),
+        "multiplier":  mult,
+        "label":       lbl,
     }
 
     save_cache(result)
     append_history({
         "date": trade_date,
-        "vxn": vxn_data["value"], "fgi": fgi_data["value"], "pe": pe_data["value"],
-        "score_vxn": round(s_vxn, 2), "score_fgi": round(s_fgi, 2), "score_pe": round(s_pe, 2),
+        "vxn": vxn_data["value"], "fgi": fgi_data["value"],
+        "pe":  pe_data.get("value", "") if pe_data else "",
+        "dd":  dd_data["value"],
+        "s_vxn": round(s_vxn, 2), "s_fgi": round(s_fgi, 2),
+        "s_pe":  round(s_pe, 2),  "s_dd":  round(s_dd, 2),
+        "fear": round(f_ax, 2),
         "composite": round(comp, 2), "multiplier": mult,
+        "score_version": 2,
     })
 
-    print(f"\n子分  → VXN {s_vxn:.1f} | FGI {s_fgi:.1f} | PE {s_pe:.1f}")
+    print(f"\n子分  → VXN {s_vxn:.1f} | FGI {s_fgi:.1f} | DD {s_dd:.1f}")
+    print(f"恐慌轴: {f_ax:.1f}  估值轴: {s_dd:.1f}")
     print(f"综合评分 : {comp:.2f}/100  →  {lbl}  {mult}x")
-    if med_mult != mult:
-        print(f"⚠ 指标分歧：单指标中位数建议 {med_mult}x")
+    if abs(f_ax - s_dd) > 25:
+        print("⚠ 两轴分歧：情绪与价位不同步")
 
     # ── 获取历史数据（绘图用）──────────────────────────────────────────
     print("\n获取历史数据（3个月）…")
@@ -203,15 +238,22 @@ def run():
     except Exception as e:
         print(f"  FGI 历史失败: {e}"); fgi_hist = {}
     try:
-        pe_hist  = fetch_pe_history(pe_data["value"])
+        pe_hist  = fetch_pe_history(pe_data["value"]) if pe_data else {}
     except Exception as e:
         print(f"  PE  历史失败: {e}"); pe_hist = {}
     try:
         qqq_hist = fetch_qqq_history()
     except Exception as e:
         print(f"  QQQ 历史失败: {e}"); qqq_hist = {}
+    try:
+        dd_hist  = fetch_dd_history()
+    except Exception as e:
+        print(f"  DD  历史失败: {e}"); dd_hist = {}
 
-    metric_histories = {"vxn": vxn_hist, "fgi": fgi_hist, "pe": pe_hist, "qqq": qqq_hist}
+    metric_histories = {
+        "vxn": vxn_hist, "fgi": fgi_hist,
+        "pe": pe_hist, "qqq": qqq_hist, "dd": dd_hist,
+    }
 
     # ── 渲染 HTML ───────────────────────────────────────────────────────
     html = render_dashboard(result, config, load_history_csv(),
