@@ -8,6 +8,7 @@ import datetime
 import requests
 import yfinance as yf
 from pathlib import Path
+from sentiment import build_qqq_sentiment
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -120,6 +121,31 @@ def fetch_fgi_history():
     result = {"dates": list(dates), "values": list(values)}
     _save_cache("fgi_history.json", result)
     print(f"  [历史] FGI: {len(dates)} 条，已缓存")
+    return result
+
+
+def fetch_sentiment_history(config):
+    """Calculate and cache three months of the configured QQQ sentiment proxy."""
+    cached = _load_cache("qqq_sentiment_history.json")
+    profile = config["sentiment_proxy"]
+    if cached and cached.get("profile") == profile:
+        return cached
+
+    df = yf.Ticker("QQQ").history(period="3y")
+    if df.empty or len(df) < 253:
+        return {"dates": [], "values": [], "profile": profile}
+
+    proxy = build_qqq_sentiment(df["Close"].dropna(), config).dropna(subset=["value"])
+    cutoff = _cutoff()
+    pairs = [
+        (d.date().isoformat(), round(float(v), 2))
+        for d, v in zip(proxy.index, proxy["value"])
+        if d.date().isoformat() >= cutoff
+    ]
+    dates, values = zip(*pairs) if pairs else ([], [])
+    result = {"dates": list(dates), "values": list(values), "profile": profile}
+    _save_cache("qqq_sentiment_history.json", result)
+    print(f"  [历史] QQQ情绪代理: {len(dates)} 条，已缓存")
     return result
 
 

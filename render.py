@@ -5,26 +5,26 @@ from scoring import (band_of, score_vxn, score_fgi, score_dd,
 
 # DD tier table (shallow → deep), used for display and chart band lookup
 _DD_TIERS = [
-    (   0,   -3, "高位运行",   "正常 1.0x"),
-    (  -3,   -7, "常规波动",   "正常 1.0x"),
-    (  -7,  -15, "技术性调整", "加仓 1.5x"),
-    ( -15,  -25, "熊市区间",   "加仓 2.0x"),
-    ( -25, -999, "深度恐慌",   "重仓 2.0x+"),
+    (   0,   -3, "高位运行",   "中性"),
+    (  -3,   -7, "常规波动",   "轻度机会"),
+    (  -7,  -15, "技术性调整", "加仓信号"),
+    ( -15,  -25, "熊市区间",   "强加仓信号"),
+    ( -25, -999, "深度恐慌",   "极端信号"),
 ]
 
 # Bands for _metric_chart — note: lo/hi are numbers, boundaries computed from hi values
 _DD_CHART_BANDS = [
-    [-100,  -25, "深度恐慌",   "重仓 2.0x+"],
-    [ -25,  -15, "熊市区间",   "加仓 2.0x"],
-    [ -15,   -7, "技术性调整", "加仓 1.5x"],
-    [  -7,   -3, "常规波动",   "正常 1.0x"],
-    [  -3,    0, "高位运行",   "正常 1.0x"],
+    [-100,  -25, "深度恐慌",   "极端信号"],
+    [ -25,  -15, "熊市区间",   "强加仓信号"],
+    [ -15,   -7, "技术性调整", "加仓信号"],
+    [  -7,   -3, "常规波动",   "轻度机会"],
+    [  -3,    0, "高位运行",   "中性"],
 ]
 
 
 def _color(metric):
     return {
-        "vxn": "#d97706", "fgi": "#c2410c",
+        "vxn": "#d97706", "fgi": "#c2410c", "sentiment": "#c2410c",
         "pe": "#dc2626",  "dd": "#dc2626",
         "composite": "#16a34a",
     }[metric]
@@ -293,11 +293,11 @@ def _dd_card(dd_data, s_dd, config, pe_data=None, history=None):
     # Tier table (5 rows, current highlighted)
     tier_rows = ""
     table_tiers = [
-        ("0% ~ −3%",   "高位运行",   "正常 1.0x"),
-        ("−3% ~ −7%",  "常规波动",   "正常 1.0x"),
-        ("−7% ~ −15%", "技术性调整", "加仓 1.5x"),
-        ("−15% ~ −25%","熊市区间",   "加仓 2.0x"),
-        ("< −25%",     "深度恐慌",   "重仓 2.0x+"),
+        ("0% ~ −3%",   "高位运行",   "中性"),
+        ("−3% ~ −7%",  "常规波动",   "轻度机会"),
+        ("−7% ~ −15%", "技术性调整", "加仓信号"),
+        ("−15% ~ −25%","熊市区间",   "强加仓信号"),
+        ("< −25%",     "深度恐慌",   "极端信号"),
     ]
     tier_labels_ordered = [r[1] for r in table_tiers]
     for rng, lbl, act in table_tiers:
@@ -356,33 +356,33 @@ def _dd_card(dd_data, s_dd, config, pe_data=None, history=None):
 
 
 def _compute_composite_history(metric_histories):
-    """Align VXN/FGI/DD history and compute daily v2 composite scores."""
+    """Align VXN/sentiment/drawdown history and compute daily scores."""
     vxn_h = metric_histories.get("vxn", {})
-    fgi_h = metric_histories.get("fgi", {})
+    sentiment_h = metric_histories.get("sentiment", metric_histories.get("fgi", {}))
     dd_h  = metric_histories.get("dd",  {})
 
-    if not (vxn_h.get("dates") and fgi_h.get("dates") and dd_h.get("dates")):
+    if not (vxn_h.get("dates") and sentiment_h.get("dates") and dd_h.get("dates")):
         return [], []
 
     vxn_map = dict(zip(vxn_h["dates"], vxn_h["values"]))
-    fgi_map = dict(zip(fgi_h["dates"], fgi_h["values"]))
+    sentiment_map = dict(zip(sentiment_h["dates"], sentiment_h["values"]))
     dd_map  = dict(zip(dd_h["dates"],  dd_h["values"]))
 
     all_dates = sorted(vxn_map)
     out_dates, out_scores = [], []
-    last_fgi = last_dd = None
+    last_sentiment = last_dd = None
 
     for d in all_dates:
         v = vxn_map.get(d)
         if v is None:
             continue
-        f = fgi_map.get(d, last_fgi)
+        sentiment = sentiment_map.get(d, last_sentiment)
         dv = dd_map.get(d, last_dd)
-        if f is not None: last_fgi = f
+        if sentiment is not None: last_sentiment = sentiment
         if dv is not None: last_dd = dv
-        if f is None or dv is None:
+        if sentiment is None or dv is None:
             continue
-        s = _composite_v2(score_vxn(v), score_fgi(f), score_dd(dv))
+        s = _composite_v2(score_vxn(v), score_fgi(sentiment), score_dd(dv))
         out_dates.append(d)
         out_scores.append(round(s, 1))
 
@@ -597,7 +597,7 @@ def render_dashboard(result, config, history_csv, metric_histories=None, offline
         )
 
     vxn = metrics["vxn"]
-    fgi = metrics["fgi"]
+    sentiment = metrics.get("sentiment", metrics.get("fgi", {}))
     pe  = metrics.get("pe", {})
     dd  = metrics.get("dd", {})
 
@@ -606,10 +606,19 @@ def render_dashboard(result, config, history_csv, metric_histories=None, offline
         vxn["value"], vxn["score"], vxn.get("stale_days", 0), config,
         history=mh.get("vxn"),
     )
-    card_fgi = _metric_card(
-        "fgi", "FGI 恐惧贪婪", "情绪",
-        fgi["value"], fgi["score"], fgi.get("stale_days", 0), config,
-        history=mh.get("fgi"),
+    components = sentiment.get("components", {})
+    profile = sentiment.get("profile", config.get("sentiment_proxy", {}))
+    component_info = (
+        f'{profile.get("trend_days", 200)}日趋势 {components.get("trend_pct", 0):+.2f}% · '
+        f'RSI({profile.get("rsi_days", 21)}) {components.get("rsi", 0):.1f}<br>'
+        f'{profile.get("vol_short_days", 40)}/{profile.get("vol_long_days", 252)}日'
+        f'波动率比 {components.get("vol_ratio", 0):.3f}'
+    )
+    card_sentiment = _metric_card(
+        "sentiment", "QQQ 情绪代理", "慢速",
+        sentiment["value"], sentiment["score"], sentiment.get("stale_days", 0), config,
+        extra_info=component_info,
+        history=mh.get("sentiment", mh.get("fgi")),
     )
     card_dd = _dd_card(
         dd, dd.get("score", 50.0), config,
@@ -620,6 +629,12 @@ def render_dashboard(result, config, history_csv, metric_histories=None, offline
     int_comp = int(comp)
     dec_comp = f"{comp:.2f}".split(".")[1]
     trend_chart = _composite_trend(mh, config, comp)
+    weights = config.get("weights", {})
+    split = config.get("fear_axis_split", {})
+    fear_pct = int(round(float(weights.get("fear", 0.65)) * 100))
+    value_pct = int(round(float(weights.get("value", 0.35)) * 100))
+    vxn_pct = int(round(float(split.get("vxn", 0.25)) * 100))
+    sentiment_pct = int(round(float(split.get("sentiment", 0.75)) * 100))
 
     return f"""<!DOCTYPE html>
 <html lang="zh">
@@ -646,7 +661,7 @@ def render_dashboard(result, config, history_csv, metric_histories=None, offline
 
   <div class="grid">
     {card_vxn}
-    {card_fgi}
+    {card_sentiment}
     {card_dd}
     <div style="background:#fffdfa;border-radius:16px;padding:18px 16px 14px;box-shadow:0 1px 6px rgba(0,0,0,.07);">
       <div style="font-size:14px;font-weight:600;color:#1c1917;margin-bottom:10px;">综合评分</div>
@@ -666,8 +681,8 @@ def render_dashboard(result, config, history_csv, metric_histories=None, offline
       </div>
       {diverge_warn}
       <div style="margin-top:10px;font-size:10px;color:#d1d5db;text-align:center;line-height:1.8;">
-        综合评分 = 恐慌轴×0.50 + 估值轴×0.50<br>
-        <span style="font-size:9px;">恐慌轴 = (VXN + FGI) ÷ 2</span>
+        综合评分 = 恐慌轴×{fear_pct}% + 回撤轴×{value_pct}%<br>
+        <span style="font-size:9px;">恐慌轴 = VXN×{vxn_pct}% + QQQ情绪代理×{sentiment_pct}%</span>
       </div>
     </div>
   </div>

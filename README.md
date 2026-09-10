@@ -1,8 +1,8 @@
 # 纳指情绪仪表盘 · Nasdaq 100 Mood Dashboard
 
-> 一个本地运行的纳斯达克 100 定投辅助工具，每日抓取 VXN / FGI / 回撤 三项指标，合成情绪评分并给出定投建议倍数，以交互式 HTML 仪表盘展示。PE 同步展示但不参与评分。
+> 一个本地运行的纳斯达克 100 定投辅助工具，每日计算 VXN / QQQ 情绪代理 / 回撤三项指标，合成情绪评分并给出定投建议倍数，以交互式 HTML 仪表盘展示。PE 同步展示但不参与评分。
 >
-> A locally-run DCA assistant for Nasdaq 100. It fetches VXN, Fear & Greed Index, and QQQ drawdown daily, computes a dual-axis composite score, and recommends a DCA multiplier — rendered as an interactive HTML dashboard. PE is displayed as a reference but excluded from scoring.
+> A locally-run DCA assistant for Nasdaq 100. It combines VXN, a price-derived QQQ sentiment proxy, and QQQ drawdown into a dual-axis score and recommended DCA multiplier. PE is displayed as a reference but excluded from scoring.
 
 ---
 
@@ -30,24 +30,24 @@
 ## 功能特性 / Features
 
 **中文**
-- 自动抓取 VXN（纳指波动率）、CNN 恐惧贪婪指数、QQQ 252 日窗口回撤
-- 双轴评分：恐慌轴（VXN+FGI）+ 估值轴（回撤），各占 50%
+- 自动获取 VXN、QQQ 行情并计算慢速情绪代理和 252 日窗口回撤
+- 情绪代理：200 日趋势 40% + 21 日 RSI 30% + 40/252 日波动率比 30%
+- 双轴评分：恐慌轴 35% + 回撤轴 65%；恐慌轴内 VXN 25% + 情绪代理 75%
 - PE 作为参考展示在回撤卡底部，不参与综合评分
-- 综合评分对应建议定投倍数（暂停 / 0.5× / 1.0× / 1.5× / 2.0×）
+- 综合评分对应建议定投倍数（1.0× / 1.5× / 2.0×），多数交易日保持 1.0×
 - 每张卡片显示近 3 个月历史折线，带虚线分层标注当前区间
 - 底部趋势图叠加 QQQ 价格走势（min-max 归一化）
-- FGI 历史时间戳已修正为美东时区，消除周五缺失/周日虚增问题
 - 离线容错：任意数据源失败自动使用缓存，全失败时展示离线模式
 - 历史数据本地缓存 20 小时，启动更快
 
 **English**
-- Auto-fetches VXN (Nasdaq volatility), CNN Fear & Greed Index, and QQQ drawdown (252-trading-day rolling peak)
-- Dual-axis scoring: Fear axis (VXN + FGI) + Value axis (drawdown), each weighted 50%
+- Fetches VXN and QQQ data, then calculates a slow QQQ sentiment proxy and 252-day drawdown
+- Sentiment proxy: 200-day trend 40% + 21-day RSI 30% + 40/252-day volatility ratio 30%
+- Dual-axis score: Fear 35% + Drawdown 65%; Fear combines VXN 25% + sentiment proxy 75%
 - PE is fetched from Nasdaq 100 constituents and shown as a reference — not included in composite score
-- Translates composite score into a DCA multiplier (pause / 0.5× / 1.0× / 1.5× / 2.0×)
+- Translates composite score into a three-tier DCA multiplier (1.0× / 1.5× / 2.0×), with most trading days at 1.0×
 - Each card shows a 3-month historical chart with dashed zone dividers and current-zone shading
 - Bottom trend panel overlays QQQ price (min-max normalised) on the composite score
-- FGI historical timestamps corrected to US Eastern timezone (fixes missing Fridays / phantom Sundays)
 - Offline fallback: gracefully degrades to cache when any or all sources fail
 - Historical data cached locally for 20 hours for faster subsequent launches
 
@@ -58,7 +58,7 @@
 | 指标 / Metric | 主源 / Primary | 备源 / Fallback |
 |---|---|---|
 | VXN | yfinance `^VXN` | Cboe 延迟报价 API |
-| FGI | CNN dataviz API（美东时区修正） | 缓存 / Cache |
+| QQQ 情绪代理 | yfinance `QQQ`（3年） | 缓存 / Cache |
 | 回撤 DD | yfinance `QQQ`（2年）252日滚动峰值 | 缓存 / Cache |
 | PE（仅展示） | slickcharts 成分股权重 + yfinance 各股 trailingPE | config.json 手动值 |
 | QQQ（叠加线） | yfinance `QQQ`（3个月） | 缓存 / Cache |
@@ -74,13 +74,13 @@ Drawdown formula: `(QQQ_close / rolling_252d_peak − 1) × 100%`
 ## 评分算法 / Scoring
 
 ```
-恐慌轴 = VXN子分 × 0.50 + FGI子分 × 0.50
+恐慌轴 = VXN子分 × 0.25 + QQQ情绪代理子分 × 0.75
 估值轴 = 回撤子分
-综合评分 = 恐慌轴 × 0.50 + 估值轴 × 0.50
+综合评分 = 恐慌轴 × 0.35 + 估值轴 × 0.65
 
-Fear axis  = VXN_score × 0.50 + FGI_score × 0.50
+Fear axis  = VXN_score × 0.25 + QQQ_sentiment_score × 0.75
 Value axis = Drawdown_score
-Composite  = Fear_axis × 0.50 + Value_axis × 0.50
+Composite  = Fear_axis × 0.35 + Value_axis × 0.65
 ```
 
 分越高 = 市场越恐慌/越便宜 = 越建议加仓
@@ -88,7 +88,7 @@ Higher score = more panic / cheaper market = higher DCA multiplier recommended
 
 ### 各指标锚点 / Anchor Points
 
-| VXN | 子分 | FGI | 子分 | 回撤 DD | 子分 |
+| VXN | 子分 | QQQ情绪代理 | 子分 | 回撤 DD | 子分 |
 |-----|------|-----|------|---------|------|
 | 10  |  0   |  0  | 100  | 0%      | 42   |
 | 15  | 20   | 25  |  80  | −5%     | 55   |
@@ -104,9 +104,7 @@ Higher score = more panic / cheaper market = higher DCA multiplier recommended
 
 | 综合评分 / Score | 建议倍数 / Multiplier | 区间 / Zone |
 |---|---|---|
-| 0 – 25   | 暂停 / Pause | 极度贪婪·高位 |
-| 25 – 40  | 0.5× | 减量 / Reduce |
-| 40 – 60  | 1.0× | 正常 / Normal |
+| 0 – 60   | 1.0× | 正常 / Normal |
 | 60 – 80  | 1.5× | 恐慌加仓 / Panic-buy |
 | 80 – 100 | 2.0× | 极度恐慌 / Extreme panic |
 
@@ -163,7 +161,8 @@ python -m pytest tests/ -v
 ```
 market-mood/
 ├── main.py              # 入口 / Entry point
-├── fetchers.py          # 数据抓取 / Data fetching (VXN, FGI, PE, drawdown)
+├── fetchers.py          # 数据抓取 / Data fetching (VXN, QQQ, PE, drawdown)
+├── sentiment.py         # QQQ 慢速情绪代理 / QQQ sentiment proxy
 ├── history_fetcher.py   # 历史数据 / Historical data (3-month charts + 2-year drawdown)
 ├── scoring.py           # 评分算法（无IO）/ Scoring — pure functions, no I/O
 ├── render.py            # HTML 渲染 / HTML rendering
@@ -176,7 +175,7 @@ market-mood/
 │   ├── latest.json
 │   ├── history.csv
 │   ├── vxn_history.json
-│   ├── fgi_history.json
+│   ├── qqq_sentiment_history.json
 │   ├── pe_history.json
 │   ├── pe_computed.json
 │   ├── qqq_history.json
@@ -191,10 +190,14 @@ market-mood/
 
 ## 版本说明 / Changelog
 
-### v2（当前 / Current）
+### v3（当前 / Current）
+- **QQQ 慢速情绪代理**：替代 CNN FGI，采用 200 日趋势、21 日 RSI 和 40/252 日波动率比
+- **近十年收益最高参数**：恐慌轴/回撤轴 35%/65%，恐慌轴内 VXN/代理指标 25%/75%
+- **三档投入**：综合分 0–60 为 1×，60–80 为 1.5×，80–100 为 2×
+
+### v2
 - **双轴评分**：用 QQQ 252日回撤（估值轴）替代 PE，解决 PE≈价格常数的冗余问题
 - **PE 降为展示项**：仍然抓取，在回撤卡底部作灰色参考，不影响评分
-- **FGI 时区修复**：CNN 时间戳按美东时区转换，消除周五缺失/周日虚增问题
 - **新增 `fetch_dd_history()`**：基于 2 年 QQQ 数据计算滚动回撤历史，用于综合走势图
 
 ### v1

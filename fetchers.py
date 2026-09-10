@@ -5,6 +5,7 @@ import requests
 import yfinance as yf
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from sentiment import build_qqq_sentiment
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -99,6 +100,43 @@ def fetch_fgi():
     return {"value": value, "as_of": date, "source": "cnn"}
 
 
+def fetch_qqq_sentiment(config):
+    """Calculate the configured QQQ sentiment proxy from trailing market data."""
+    try:
+        df = yf.Ticker("QQQ").history(period="3y")
+        if df.empty or len(df) < 253:
+            raise FetchError("QQQ history is insufficient for sentiment proxy")
+        close = df["Close"].dropna()
+        proxy = build_qqq_sentiment(close, config).dropna(subset=["value"])
+        if proxy.empty:
+            raise FetchError("QQQ sentiment proxy returned no valid values")
+        latest = proxy.iloc[-1]
+        value = float(latest["value"])
+        if not (0 <= value <= 100):
+            raise FetchError(f"QQQ sentiment value {value} out of range")
+        profile = config["sentiment_proxy"]
+        return {
+            "value": value,
+            "as_of": proxy.index[-1].date().isoformat(),
+            "source": "QQQ price-derived",
+            "components": {
+                "trend_pct": round(float(latest["trend_pct"]), 2),
+                "rsi": round(float(latest["rsi"]), 2),
+                "vol_ratio": round(float(latest["vol_ratio"]), 3),
+            },
+            "profile": {
+                "trend_days": int(profile["trend_days"]),
+                "rsi_days": int(profile["rsi_days"]),
+                "vol_short_days": int(profile["vol_short_days"]),
+                "vol_long_days": int(profile["vol_long_days"]),
+            },
+        }
+    except FetchError:
+        raise
+    except Exception as e:
+        raise FetchError(f"QQQ sentiment proxy failed: {e}") from e
+
+
 def fetch_pe(config):
     """Three-level PE fetch: computed → cached-computed → manual config."""
     cache_dir = Path(__file__).parent / "cache"
@@ -122,6 +160,22 @@ def fetch_pe(config):
                 }
         except Exception:
             pass
+
+    # PE is display-only. When disabled, avoid blocking dashboard startup on
+    # roughly 100 constituent quote requests and use the configured reference.
+    if not config.get("pe_live_fetch", True):
+        pm = config.get("pe_manual", {})
+        value = float(pm.get("value", 30.0))
+        as_of = pm.get("as_of", "2000-01-01")
+        if not (10 <= value <= 80):
+            raise FetchError(f"Manual PE value {value} out of range")
+        stale = (datetime.date.today() - datetime.date.fromisoformat(as_of)).days
+        return {
+            "value": value,
+            "as_of": as_of,
+            "source": "manual(config)",
+            "stale_days": stale,
+        }
 
     try:
         result = _compute_ndx100_pe()

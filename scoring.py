@@ -46,12 +46,20 @@ def score_dd(dd_pct):
     return _interp(min(float(dd_pct), 0.0), DD_ANCHORS)
 
 
-def fear_axis(s_vxn, s_fgi):
-    return 0.5 * s_vxn + 0.5 * s_fgi
+def fear_axis(s_vxn, s_sentiment):
+    split = _cfg.get("fear_axis_split", {})
+    w_vxn = float(split.get("vxn", 0.5))
+    w_sentiment = float(split.get("sentiment", split.get("fgi", 0.5)))
+    return w_vxn * s_vxn + w_sentiment * s_sentiment
 
 
-def composite_v2(s_vxn, s_fgi, s_dd, w_fear=0.50, w_value=0.50):
-    return w_fear * fear_axis(s_vxn, s_fgi) + w_value * s_dd
+def composite_v2(s_vxn, s_sentiment, s_dd, w_fear=None, w_value=None):
+    weights = _cfg.get("weights", {})
+    if w_fear is None:
+        w_fear = float(weights.get("fear", 0.50))
+    if w_value is None:
+        w_value = float(weights.get("value", 0.50))
+    return w_fear * fear_axis(s_vxn, s_sentiment) + w_value * s_dd
 
 
 def band_of(metric, value):

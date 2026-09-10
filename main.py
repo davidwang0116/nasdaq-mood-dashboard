@@ -8,12 +8,13 @@ import http.server
 import webbrowser
 from pathlib import Path
 
-from fetchers import fetch_vxn_with_fallback, fetch_fgi, fetch_pe, fetch_drawdown, FetchError
+from fetchers import (fetch_vxn_with_fallback, fetch_qqq_sentiment,
+                      fetch_pe, fetch_drawdown, FetchError)
 from scoring import (score_vxn, score_fgi, score_pe, score_dd,
                      fear_axis, composite_v2,
                      multiplier_of, multiplier_label)
 from render import render_dashboard
-from history_fetcher import (fetch_vxn_history, fetch_fgi_history,
+from history_fetcher import (fetch_vxn_history, fetch_sentiment_history,
                               fetch_pe_history, fetch_qqq_history, fetch_dd_history)
 
 BASE         = Path(__file__).parent
@@ -25,8 +26,8 @@ CONFIG_FILE  = BASE / "config.json"
 DASHBOARD    = OUT_DIR / "dashboard.html"
 SERVER_PORT  = 8765
 
-HISTORY_COLS = ["date", "vxn", "fgi", "pe", "dd",
-                "s_vxn", "s_fgi", "s_pe", "s_dd",
+HISTORY_COLS = ["date", "vxn", "sentiment", "pe", "dd",
+                "s_vxn", "s_sentiment", "s_pe", "s_dd",
                 "fear", "composite", "multiplier", "score_version"]
 
 
@@ -46,15 +47,19 @@ def save_cache(result):
 
 
 def _migrate_history():
-    """Backup v1 history.csv (missing dd column) and start fresh."""
+    """Backup history from an older score schema and start fresh."""
     if not HISTORY_FILE.exists():
         return
     with HISTORY_FILE.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    if rows and "dd" not in rows[0]:
-        backup = CACHE_DIR / "history_v1_backup.csv"
+    if rows and set(rows[0]) != set(HISTORY_COLS):
+        version = rows[0].get("score_version", "legacy")
+        backup = CACHE_DIR / f"history_v{version}_backup.csv"
+        if backup.exists():
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup = CACHE_DIR / f"history_v{version}_backup_{stamp}.csv"
         HISTORY_FILE.rename(backup)
-        print(f"  [迁移] v1历史已备份到 {backup.name}，新文件从今日重新开始")
+        print(f"  [迁移] 旧历史已备份到 {backup.name}，新评分从今日重新开始")
 
 
 def append_history(row):
@@ -127,7 +132,7 @@ def run():
     config = load_config()
     cache  = load_cache()
 
-    print("=== 纳指情绪仪表盘 v2 ===")
+    print("=== 纳指情绪仪表盘 v3 ===")
     print(f"运行时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     _migrate_history()
@@ -141,10 +146,13 @@ def run():
         print(f"严重: {e}"); offline = True; vxn_data = None
 
     try:
-        fgi_data, _ = fetch_with_cache(fetch_fgi, "fgi", cache)
-        print(f"  FGI  : {fgi_data['value']:.2f}  [{fgi_data['as_of']}] via {fgi_data['source']}")
+        sentiment_data, _ = fetch_with_cache(
+            fetch_qqq_sentiment, "sentiment", cache, config
+        )
+        print(f"  情绪代理: {sentiment_data['value']:.2f}  "
+              f"[{sentiment_data['as_of']}] via {sentiment_data['source']}")
     except RuntimeError as e:
-        print(f"严重: {e}"); offline = True; fgi_data = None
+        print(f"严重: {e}"); offline = True; sentiment_data = None
 
     # PE: non-fatal — only used for display, not composite score
     try:
@@ -165,7 +173,7 @@ def run():
         print(f"严重: {e}"); offline = True; dd_data = None
 
     # ── 离线兜底 ────────────────────────────────────────────────────────
-    if offline or (vxn_data is None and fgi_data is None and dd_data is None):
+    if offline or (vxn_data is None and sentiment_data is None and dd_data is None):
         if cache:
             print("\n全部数据源失败，展示缓存（离线模式）")
             _write_and_open(
@@ -176,17 +184,17 @@ def run():
 
     # ── 打分 ────────────────────────────────────────────────────────────
     s_vxn = score_vxn(vxn_data["value"])
-    s_fgi = score_fgi(fgi_data["value"])
+    s_sentiment = score_fgi(sentiment_data["value"])
     s_pe  = score_pe(pe_data["value"]) if pe_data else 50.0
     s_dd  = score_dd(dd_data["value"])
-    f_ax  = fear_axis(s_vxn, s_fgi)
-    comp  = composite_v2(s_vxn, s_fgi, s_dd)
+    f_ax  = fear_axis(s_vxn, s_sentiment)
+    comp  = composite_v2(s_vxn, s_sentiment, s_dd)
     mult  = multiplier_of(comp)
     lbl   = multiplier_label(comp)
 
     trade_date = max(
         vxn_data.get("as_of", ""),
-        fgi_data.get("as_of", ""),
+        sentiment_data.get("as_of", ""),
         dd_data.get("as_of", ""),
     )
 
@@ -197,7 +205,7 @@ def run():
         "trade_date": trade_date,
         "metrics": {
             "vxn": {**vxn_data, "score": round(s_vxn, 2)},
-            "fgi": {**fgi_data, "score": round(s_fgi, 2)},
+            "sentiment": {**sentiment_data, "score": round(s_sentiment, 2)},
             "pe":  {**(pe_data or {}), "score": round(s_pe, 2)},
             "dd":  {**dd_data,  "score": round(s_dd, 2)},
         },
@@ -211,17 +219,17 @@ def run():
     save_cache(result)
     append_history({
         "date": trade_date,
-        "vxn": vxn_data["value"], "fgi": fgi_data["value"],
+        "vxn": vxn_data["value"], "sentiment": sentiment_data["value"],
         "pe":  pe_data.get("value", "") if pe_data else "",
         "dd":  dd_data["value"],
-        "s_vxn": round(s_vxn, 2), "s_fgi": round(s_fgi, 2),
+        "s_vxn": round(s_vxn, 2), "s_sentiment": round(s_sentiment, 2),
         "s_pe":  round(s_pe, 2),  "s_dd":  round(s_dd, 2),
         "fear": round(f_ax, 2),
         "composite": round(comp, 2), "multiplier": mult,
-        "score_version": 2,
+        "score_version": config.get("score_version", 3),
     })
 
-    print(f"\n子分  → VXN {s_vxn:.1f} | FGI {s_fgi:.1f} | DD {s_dd:.1f}")
+    print(f"\n子分  → VXN {s_vxn:.1f} | 情绪代理 {s_sentiment:.1f} | DD {s_dd:.1f}")
     print(f"恐慌轴: {f_ax:.1f}  估值轴: {s_dd:.1f}")
     print(f"综合评分 : {comp:.2f}/100  →  {lbl}  {mult}x")
     if abs(f_ax - s_dd) > 25:
@@ -234,9 +242,9 @@ def run():
     except Exception as e:
         print(f"  VXN 历史失败: {e}"); vxn_hist = {}
     try:
-        fgi_hist = fetch_fgi_history()
+        sentiment_hist = fetch_sentiment_history(config)
     except Exception as e:
-        print(f"  FGI 历史失败: {e}"); fgi_hist = {}
+        print(f"  情绪代理历史失败: {e}"); sentiment_hist = {}
     try:
         pe_hist  = fetch_pe_history(pe_data["value"]) if pe_data else {}
     except Exception as e:
@@ -251,7 +259,7 @@ def run():
         print(f"  DD  历史失败: {e}"); dd_hist = {}
 
     metric_histories = {
-        "vxn": vxn_hist, "fgi": fgi_hist,
+        "vxn": vxn_hist, "sentiment": sentiment_hist,
         "pe": pe_hist, "qqq": qqq_hist, "dd": dd_hist,
     }
 
