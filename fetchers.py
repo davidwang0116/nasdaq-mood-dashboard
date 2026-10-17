@@ -27,7 +27,14 @@ class FetchError(Exception):
 
 
 def _cnn_ts_to_date(ts) -> str:
-    """CNN timestamp (ms int or ISO string) → NY-local date YYYY-MM-DD."""
+    """CNN timestamp (ms int or ISO string) → trading date YYYY-MM-DD.
+
+    CNN stamps each daily history point at 00:00 UTC *of the trading date it
+    describes* (every one of them lands on Mon-Fri in UTC; converting to New
+    York turns Mon→Sun and Fri→Thu and shifts the whole series back a day —
+    correlating it with QQQ's next-day return instead of the same-day one).
+    Midnight stamps therefore keep their UTC date; the live "now" reading has
+    an intraday timestamp and is dated in New York."""
     if isinstance(ts, (int, float)):
         dt = datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.timezone.utc)
     else:
@@ -38,6 +45,8 @@ def _cnn_ts_to_date(ts) -> str:
             return s[:10]
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=datetime.timezone.utc)
+    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        return dt.date().isoformat()
     return dt.astimezone(_NY).date().isoformat()
 
 
@@ -85,8 +94,15 @@ def fetch_vxn_with_fallback():
         return _fetch_vxn_cboe()
 
 
+_CNN_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+
+
+def _cnn_headers():
+    return {**HEADERS, "Referer": "https://edition.cnn.com/"}
+
+
 def fetch_fgi():
-    r = _get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata")
+    r = _get(_CNN_URL)
     data = r.json()
     fg = data["fear_and_greed"]
     value = float(fg["score"])
@@ -97,7 +113,51 @@ def fetch_fgi():
         date = _cnn_ts_to_date(ts) if ts else datetime.date.today().isoformat()
     except Exception:
         date = datetime.date.today().isoformat()
-    return {"value": value, "as_of": date, "source": "cnn"}
+    return {
+        "value": value, "as_of": date, "source": "cnn",
+        "rating": fg.get("rating", ""),
+        "previous_close": fg.get("previous_close"),
+        "previous_1_week": fg.get("previous_1_week"),
+    }
+
+
+def fetch_fgi_series(start=None):
+    """CNN Fear & Greed daily history as {date: value}, plus the live reading.
+    Default ≈1 year; pass start="YYYY-MM-DD" (≥2020-07-14) for longer history.
+    Dated by _cnn_ts_to_date so it lines up with QQQ closes."""
+    url = f"{_CNN_URL}/{start}" if start else _CNN_URL
+    r = requests.get(url, headers=_cnn_headers(), timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    series = {}
+    for item in data.get("fear_and_greed_historical", {}).get("data", []):
+        y = item.get("y")
+        if y is None:
+            continue
+        series[_cnn_ts_to_date(item.get("x", 0))] = float(y)
+    fg = data["fear_and_greed"]
+    live_value = float(fg["score"])
+    live_date = _cnn_ts_to_date(fg.get("timestamp", "")) if fg.get("timestamp") \
+        else datetime.date.today().isoformat()
+    series[live_date] = live_value
+    live = {
+        "value": live_value, "as_of": live_date, "source": "cnn",
+        "rating": fg.get("rating", ""),
+        "previous_close": fg.get("previous_close"),
+        "previous_1_week": fg.get("previous_1_week"),
+    }
+    return series, live
+
+
+def fetch_price_history(period="3y"):
+    """QQQ and ^VXN daily closes (dividend-adjusted, as the backtests use)."""
+    q = yf.Ticker("QQQ").history(period=period)
+    v = yf.Ticker("^VXN").history(period=period)
+    if q.empty or len(q) < 400:
+        raise FetchError("QQQ history is insufficient")
+    if v.empty or len(v) < 200:
+        raise FetchError("^VXN history is insufficient")
+    return q["Close"].dropna(), v["Close"].dropna()
 
 
 def fetch_qqq_sentiment(config):

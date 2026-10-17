@@ -108,3 +108,136 @@ def test_three_multiplier_bands():
     assert multiplier_of(60.0)  == 1.5
     assert multiplier_of(79.99) == 1.5
     assert multiplier_of(80.0)  == 2.0
+
+
+# ── v4 tests: smooth, volatility-adaptive scoring ────────────────────────────
+import numpy as np
+from scoring import (score_dd_adaptive, dd_at_score, score_vxn_blend,
+                     score_sentiment_blend, score_valuation, composite_v4,
+                     multiplier_tier, monotone_interp, score_frame)
+
+
+def test_dd_adaptive_zero_and_saturation():
+    assert score_dd_adaptive(0, 20) == pytest.approx(0.0)
+    assert score_dd_adaptive(5, 20) == pytest.approx(0.0)      # positive = at high
+    assert score_dd_adaptive(-80, 20) == pytest.approx(100.0, abs=0.01)
+
+
+def test_dd_adaptive_depends_on_volatility():
+    # the same -7% is a bigger event in a calm market than in a stormy one
+    assert score_dd_adaptive(-7, 15) > score_dd_adaptive(-7, 25) > score_dd_adaptive(-7, 40)
+
+
+def test_dd_adaptive_is_smooth_and_monotone():
+    dd = np.linspace(0, -30, 3001)
+    s = score_dd_adaptive(dd, 20)
+    assert np.all(np.diff(s) >= 0)
+    # no kinks: second differences stay tiny and keep one sign (concave)
+    assert np.max(np.abs(np.diff(s, 2))) < 0.01
+    assert np.all(np.diff(s, 2) <= 1e-9)
+
+
+def test_dd_at_score_inverse():
+    for vol in (12, 20, 35):
+        for target in (25, 50, 70, 88):
+            dd = dd_at_score(target, vol)
+            assert score_dd_adaptive(dd, vol) == pytest.approx(target, abs=1e-6)
+
+
+def test_vol_floor():
+    assert score_dd_adaptive(-5, 1.0) == pytest.approx(score_dd_adaptive(-5, 10.0))
+
+
+def test_vxn_blend():
+    assert score_vxn_blend(24, 0.5) == pytest.approx(0.5 * 50 + 0.5 * 50)
+    assert score_vxn_blend(24, float("nan")) == pytest.approx(50.0)   # level only
+    assert score_vxn_blend(35, 0.99) > score_vxn_blend(18, 0.1)
+
+
+def test_monotone_interp_matches_anchors_and_is_monotone():
+    anchors = [[0, 100], [25, 80], [40, 60], [55, 40], [75, 20], [100, 0]]
+    for x, y in anchors:
+        assert monotone_interp(x, anchors) == pytest.approx(y)
+    xs = np.linspace(0, 100, 1001)
+    assert np.all(np.diff(monotone_interp(xs, anchors)) <= 1e-9)
+
+
+def test_sentiment_blend_falls_back_to_proxy():
+    both = score_sentiment_blend(18.0, 61.0)
+    proxy_only = score_sentiment_blend(float("nan"), 61.0)
+    assert proxy_only == pytest.approx(monotone_interp(61.0, [[0, 100], [25, 80], [40, 60], [55, 40], [75, 20], [100, 0]]))
+    assert both > proxy_only          # extreme fear pulls the blend up
+
+
+def test_valuation_derating_scores_high():
+    # deeper de-rating from the 1-year high = cheaper = higher score
+    assert score_valuation(0.0) == pytest.approx(0.0)
+    assert score_valuation(-30.0) > score_valuation(-10.0) > score_valuation(-2.0)
+    assert score_valuation(-80.0) > 95.0
+    assert np.isnan(score_valuation(float("nan")))
+
+
+def test_valuation_weight_at_least_drawdown_weight():
+    import json
+    from pathlib import Path
+    w = json.loads((Path(__file__).parent.parent / "config.json").read_text(encoding="utf-8"))["weights"]
+    assert w["valuation"] >= w["drawdown"]
+    assert w["fear"] + w["drawdown"] + w["valuation"] == pytest.approx(1.0)
+
+
+def test_composite_renormalises_without_valuation():
+    c_with, _ = composite_v4(60, 60, 60, 60)
+    c_without, _ = composite_v4(60, 60, 60, float("nan"))
+    assert c_with == pytest.approx(60.0) and c_without == pytest.approx(60.0)
+    # weights are renormalised, so a missing term does not drag the score down
+    c3, _ = composite_v4(80, 80, 40, float("nan"))
+    assert c3 == pytest.approx((0.30 * 80 + 0.35 * 40) / 0.65)
+
+
+def test_multiplier_tiers():
+    assert multiplier_tier(30) == 1.0
+    assert multiplier_tier(73.74) == 1.0
+    assert multiplier_tier(73.75) == 1.5
+    assert multiplier_tier(77.49) == 1.5
+    assert multiplier_tier(77.5) == 2.0
+    assert multiplier_tier(99) == 2.0
+    xs = np.linspace(30, 100, 701)
+    assert np.all(np.diff(multiplier_tier(xs)) >= 0)
+    assert set(np.unique(multiplier_tier(xs))) == {1.0, 1.5, 2.0}
+
+
+import copy, json as _json
+from pathlib import Path as _P
+CAP_CFG = _json.loads((_P(__file__).parent.parent / 'config.json').read_text(encoding='utf-8'))
+CAP_CFG['multiplier_tiers']['budget'] = {'window_days': 252, 'max_days': 42}
+
+
+def test_enhancement_budget_caps_a_year_at_one_sixth():
+    from scoring import apply_enhancement_budget
+    always = np.full(1000, 2.0)
+    out = apply_enhancement_budget(always, CAP_CFG)
+    # any trailing 252-day window holds at most 42 enhanced days
+    e = (out > 1).astype(int)
+    assert np.convolve(e, np.ones(252, dtype=int), "valid").max() <= 42
+    assert e[:42].all() and not e[42:252].any()      # budget burns first, then 1.0x
+    assert e[252]                                    # refills as old days roll off
+
+
+def test_enhancement_budget_leaves_sparse_signals_alone():
+    from scoring import apply_enhancement_budget
+    sparse = np.ones(600)
+    sparse[[10, 100, 300, 450]] = 1.5
+    assert np.array_equal(apply_enhancement_budget(sparse, CAP_CFG), sparse)
+
+
+def test_score_frame_matches_scalar_path():
+    import pandas as pd
+    F = pd.DataFrame({"vxn": [27.13], "vxn_pct": [0.85], "fgi": [17.94], "proxy": [61.05],
+                      "dd": [-6.56], "vol": [18.4], "fpe_dd": [-28.9]})
+    out = score_frame(F)
+    s_vxn = score_vxn_blend(27.13, 0.85)
+    s_sent = score_sentiment_blend(17.94, 61.05)
+    s_dd = score_dd_adaptive(-6.56, 18.4)
+    comp, _ = composite_v4(s_vxn, s_sent, s_dd, score_valuation(-28.9))
+    assert out["composite"].iloc[0] == pytest.approx(comp)
+    assert out["multiplier"].iloc[0] == multiplier_tier(comp)
